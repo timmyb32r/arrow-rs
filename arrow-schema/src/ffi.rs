@@ -100,6 +100,7 @@ pub struct FFI_ArrowSchema {
 struct SchemaPrivateData {
     children: Box<[*mut FFI_ArrowSchema]>,
     dictionary: *mut FFI_ArrowSchema,
+    name: Option<CString>,
     metadata: Option<Vec<u8>>,
 }
 
@@ -112,9 +113,6 @@ unsafe extern "C" fn release_schema(schema: *mut FFI_ArrowSchema) {
 
     // take ownership back to release it.
     drop(unsafe { CString::from_raw(schema.format.cast_mut()) });
-    if !schema.name.is_null() {
-        drop(unsafe { CString::from_raw(schema.name.cast_mut()) });
-    }
     if !schema.private_data.is_null() {
         let private_data =
             unsafe { Box::from_raw(schema.private_data.cast::<SchemaPrivateData>()) };
@@ -171,6 +169,7 @@ impl FFI_ArrowSchema {
         let mut private_data = Box::new(SchemaPrivateData {
             children: children_ptr,
             dictionary: dictionary_ptr,
+            name: None,
             metadata: None,
         });
 
@@ -188,32 +187,26 @@ impl FFI_ArrowSchema {
     ///
     /// # Errors
     ///
-    /// Returns an error if `name` contains an interior nul byte, or if the schema
-    /// does not use this crate's original release callback. Empty schemas and
-    /// schemas with a replaced release callback cannot be renamed.
-    pub fn with_name(mut self, name: &str) -> Result<Self, ArrowError> {
-        if !self.release.is_some_and(|release| {
-            std::ptr::fn_addr_eq(
-                release,
-                release_schema as unsafe extern "C" fn(*mut FFI_ArrowSchema),
-            )
-        }) {
-            return Err(ArrowError::CDataInterface(
-                "Cannot set name on a schema with a foreign or missing release callback".to_owned(),
-            ));
-        }
-
+    /// Returns an error if `name` contains an interior nul byte.
+    ///
+    /// # Safety
+    ///
+    /// `self` must be a live schema produced by this crate (e.g. via
+    /// [`FFI_ArrowSchema::try_new`] or a `TryFrom`), with its original
+    /// `private_data`. It must not be a foreign schema or
+    /// [`FFI_ArrowSchema::empty`]. This method interprets `private_data` as
+    /// this crate's private storage.
+    pub unsafe fn with_name(mut self, name: &str) -> Result<Self, ArrowError> {
         let name = CString::new(name).map_err(|e| {
             ArrowError::CDataInterface(format!(
                 "Null byte at position {} not allowed in name",
                 e.nul_position()
             ))
         })?;
-        let old_name = std::mem::replace(&mut self.name, name.into_raw());
-        if !old_name.is_null() {
-            // SAFETY: our release callback owns names allocated by CString::into_raw.
-            drop(unsafe { CString::from_raw(old_name.cast_mut()) });
-        }
+        // SAFETY: the caller guarantees that private_data is this crate's original
+        // SchemaPrivateData, and self owns it exclusively during this update.
+        let private_data = unsafe { &mut *self.private_data.cast::<SchemaPrivateData>() };
+        self.name = private_data.name.insert(name).as_ptr();
         Ok(self)
     }
 
@@ -913,11 +906,14 @@ impl TryFrom<&Field> for FFI_ArrowSchema {
             flags |= Flags::MAP_KEYS_SORTED;
         }
 
-        let schema = FFI_ArrowSchema::try_from(field.data_type())?
-            .with_name(field.name())?
-            .with_flags(flags)?;
+        let schema = FFI_ArrowSchema::try_from(field.data_type())?;
         // SAFETY: schema was just constructed by this crate.
-        unsafe { schema.with_metadata(field.metadata()) }
+        unsafe {
+            schema
+                .with_name(field.name())?
+                .with_flags(flags)?
+                .with_metadata(field.metadata())
+        }
     }
 }
 
@@ -1200,15 +1196,15 @@ mod tests {
             .into(),
         ];
 
-        let mut schema = FFI_ArrowSchema::try_new("b", vec![], None)
-            .unwrap()
-            .with_name("test")
-            .unwrap();
+        let schema = FFI_ArrowSchema::try_new("b", vec![], None).unwrap();
+        // SAFETY: schema was just constructed by this crate.
+        let mut schema = unsafe { schema.with_name("test") }.unwrap();
 
         for metadata in metadata_cases {
             // SAFETY: schema was constructed by this crate via try_new.
             schema = unsafe { schema.with_metadata(&metadata) }.unwrap();
             let field = Field::try_from(&schema).unwrap();
+            assert_eq!(field.name(), "test");
             assert_eq!(field.metadata(), &metadata);
         }
     }
@@ -1216,21 +1212,24 @@ mod tests {
     #[test]
     fn test_name_with_null_byte() {
         let schema = FFI_ArrowSchema::try_new("i", vec![], None).unwrap();
-        assert!(schema.with_name("ab\0cd").is_err());
+        // SAFETY: schema was just constructed by this crate.
+        let schema = unsafe { schema.with_name("original") }.unwrap();
+        // SAFETY: schema still has its original private_data.
+        assert!(unsafe { schema.with_name("ab\0cd") }.is_err());
     }
 
     #[test]
     fn test_replacing_name_releases_previous_allocation() {
-        let schema = FFI_ArrowSchema::try_from(&DataType::Int32)
-            .unwrap()
-            .with_name("first")
-            .unwrap();
+        let schema = FFI_ArrowSchema::try_from(&DataType::Int32).unwrap();
+        // SAFETY: schema was just constructed by this crate.
+        let schema = unsafe { schema.with_name("first") }.unwrap();
         TRACKED_NAME.store(
             schema.name().unwrap().as_ptr().cast_mut(),
             Ordering::Relaxed,
         );
 
-        let schema = schema.with_name("second").unwrap();
+        // SAFETY: schema still has its original private_data.
+        let schema = unsafe { schema.with_name("second") }.unwrap();
         assert_eq!(schema.name(), Some("second"));
         assert_eq!(RELEASED_NAMES.load(Ordering::Relaxed), 1);
 
@@ -1243,28 +1242,25 @@ mod tests {
     }
 
     #[test]
-    fn test_with_name_rejects_empty_schema() {
-        assert!(FFI_ArrowSchema::empty().with_name("name").is_err());
-    }
+    fn test_with_name_after_move() {
+        let field = Field::new("before", DataType::Int32, true)
+            .with_metadata(HashMap::from([("key".to_owned(), "old".to_owned())]));
+        let mut original = FFI_ArrowSchema::try_from(&field).unwrap();
+        // SAFETY: original is an initialized, exclusively owned schema.
+        let schema = unsafe { FFI_ArrowSchema::from_raw(&raw mut original) };
+        assert!(original.release().is_none());
+        drop(original);
 
-    #[test]
-    fn test_with_name_rejects_foreign_schema() {
-        unsafe extern "C" fn release_foreign_schema(schema: *mut FFI_ArrowSchema) {
-            let schema = unsafe { &mut *schema };
-            let released = unsafe { Box::from_raw(schema.private_data.cast::<Arc<AtomicBool>>()) };
-            released.store(true, Ordering::SeqCst);
-            schema.release = None;
-        }
+        // SAFETY: moving the schema preserves its original private_data.
+        let schema = unsafe { schema.with_name("after") }.unwrap();
+        assert_eq!(schema.metadata().unwrap()["key"], "old");
 
-        let released = Arc::new(AtomicBool::new(false));
-        let mut schema = FFI_ArrowSchema::empty();
-        schema.format = c"i".as_ptr();
-        schema.name = c"borrowed name".as_ptr();
-        schema.release = Some(release_foreign_schema);
-        schema.private_data = Box::into_raw(Box::new(released.clone())).cast();
-
-        assert!(schema.with_name("new name").is_err());
-        assert!(released.load(Ordering::SeqCst));
+        // SAFETY: schema still has its original private_data.
+        let schema = unsafe { schema.with_metadata([("key", "updated")]) }.unwrap();
+        assert_eq!(schema.name(), Some("after"));
+        let expected = Field::new("after", DataType::Int32, true)
+            .with_metadata(HashMap::from([("key".to_owned(), "updated".to_owned())]));
+        assert_eq!(Field::try_from(&schema).unwrap(), expected);
     }
 
     #[test]
@@ -1300,7 +1296,8 @@ mod tests {
 
     #[test]
     fn test_wrap_release_callback() {
-        let mut schema = FFI_ArrowSchema::try_from(&DataType::Int32).unwrap();
+        let field = Field::new("wrapped", DataType::Int32, false);
+        let mut schema = FFI_ArrowSchema::try_from(&field).unwrap();
 
         let data = Box::new(WrapperData {
             original_release: schema.release(),
