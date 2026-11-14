@@ -126,6 +126,16 @@ impl BooleanBufferBuilder {
     /// Advances the buffer by `additional` bits
     #[inline]
     pub fn advance(&mut self, additional: usize) {
+        if additional != 0 && self.len & 7 != 0 {
+            let keep = (1_u8 << (self.len & 7)) - 1;
+            self.buffer.as_slice_mut()[self.len / 8] &= keep;
+        }
+        self.grow(additional);
+    }
+
+    // New bytes are zeroed; callers must overwrite or clear the old partial byte.
+    #[inline]
+    fn grow(&mut self, additional: usize) {
         let new_len = self.len + additional;
         let new_len_bytes = bit_util::ceil(new_len, 8);
         if new_len_bytes > self.buffer.len() {
@@ -181,10 +191,16 @@ impl BooleanBufferBuilder {
     /// Appends a boolean `v` into the buffer
     #[inline]
     pub fn append(&mut self, v: bool) {
-        self.advance(1);
-        if v {
-            unsafe { bit_util::set_bit_raw(self.buffer.as_mut_ptr(), self.len - 1) };
+        let index = self.len;
+        if index & 7 == 0 {
+            self.buffer.push(u8::from(v));
+            self.len += 1;
+            return;
         }
+        self.len += 1;
+        let bit = index & 7;
+        let byte = &mut self.buffer.as_slice_mut()[index / 8];
+        *byte = (*byte & ((1_u8 << bit) - 1)) | (u8::from(v) << bit);
     }
 
     /// Appends the low `count` bits from `word` into the buffer.
@@ -200,31 +216,26 @@ impl BooleanBufferBuilder {
         let mask = (u64::MAX >> ((64 - count) & 63)) * ((count != 0) as u64);
         let word = word & mask;
 
-        let new_len = self.len + count;
-        let new_len_bytes = bit_util::ceil(new_len, 8);
-        if new_len_bytes > self.buffer.len() {
-            self.buffer.resize(new_len_bytes, 0);
+        if count == 0 {
+            return;
         }
-
         let bit_offset = self.len & 7;
         let byte_start = self.len / 8;
+        self.grow(count);
         let buf = self.buffer.as_slice_mut();
 
-        // Shift the word to align with the bit offset within the
-        // current byte, then OR it into the buffer. The shift merges
-        // correctly with any existing bits in the partial trailing byte.
+        // Preserve the existing prefix only; dirty padding must not enter the appended bits.
         let shifted = word << bit_offset;
         let shifted_bytes = shifted.to_le_bytes();
         let bytes_to_write = bit_util::ceil(count + bit_offset, 8).min(8);
-        for i in 0..bytes_to_write {
-            buf[byte_start + i] |= shifted_bytes[i];
-        }
+        let keep = (1_u8 << bit_offset) - 1;
+        buf[byte_start] = (buf[byte_start] & keep) | shifted_bytes[0];
+        buf[byte_start + 1..byte_start + bytes_to_write]
+            .copy_from_slice(&shifted_bytes[1..bytes_to_write]);
         // When bit_offset > 0 the shift can overflow into a 9th byte.
         if bit_offset > 0 && count + bit_offset > 64 {
-            buf[byte_start + 8] |= (word >> (64 - bit_offset)) as u8;
+            buf[byte_start + 8] = (word >> (64 - bit_offset)) as u8;
         }
-
-        self.len = new_len;
     }
 
     /// Appends n `additional` bits of value `v` into the buffer
@@ -260,7 +271,7 @@ impl BooleanBufferBuilder {
     #[inline]
     pub fn append_slice(&mut self, slice: &[bool]) {
         let additional = slice.len();
-        self.advance(additional);
+        self.grow(additional);
 
         let offset = self.len() - additional;
 
@@ -274,9 +285,10 @@ impl BooleanBufferBuilder {
             // At most 8 bits starting at bit 7 end at bit 14, so they span at most two bytes
             let bits = (Self::pack_bits(slice) as u16) << (offset % 8);
             let buffer = self.buffer.as_slice_mut();
-            buffer[offset / 8] |= bits as u8;
+            let keep = (1_u8 << (offset & 7)) - 1;
+            buffer[offset / 8] = (buffer[offset / 8] & keep) | bits as u8;
             if let Some(next) = buffer.get_mut(offset / 8 + 1) {
-                *next |= (bits >> 8) as u8;
+                *next = (bits >> 8) as u8;
             }
         } else {
             self.pack_slice(offset, slice)
@@ -305,7 +317,11 @@ impl BooleanBufferBuilder {
         // Fill the first byte up to the next byte boundary
         let head = ((8 - offset % 8) % 8).min(additional);
         let (head_slice, rest) = slice.split_at(head);
-        buffer[offset / 8] |= Self::pack_bits(head_slice) << (offset % 8);
+        if head != 0 {
+            let keep = (1_u8 << (offset & 7)) - 1;
+            buffer[offset / 8] =
+                (buffer[offset / 8] & keep) | (Self::pack_bits(head_slice) << (offset & 7));
+        }
 
         // Pack 8 bools into each byte without branching: a `bool` is a byte
         // holding 0 or 1, and the multiply moves byte `i` to bit `56 + i`
@@ -319,7 +335,7 @@ impl BooleanBufferBuilder {
 
         // The remainder starts on a byte boundary
         if !remainder.is_empty() {
-            buffer[(self.len - remainder.len()) / 8] |= Self::pack_bits(remainder);
+            buffer[(self.len - remainder.len()) / 8] = Self::pack_bits(remainder);
         }
     }
 
@@ -873,5 +889,224 @@ mod tests {
                 assert!(finished.value(start + len));
             }
         }
+    }
+
+    fn dirty_padding(builder: &mut BooleanBufferBuilder, pattern: u8, use_set_bit: bool) {
+        let len = builder.len();
+        if use_set_bit {
+            for index in len..builder.as_slice().len() * 8 {
+                builder.set_bit(index, pattern & (1 << (index % 8)) != 0);
+            }
+        } else if !len.is_multiple_of(8) {
+            let preserve = (1_u8 << (len % 8)) - 1;
+            let last = builder.as_slice_mut().last_mut().unwrap();
+            *last = (*last & preserve) | (pattern & !preserve);
+        } else {
+            // A mutable borrow may mark the builder dirty even when it changes nothing.
+            let _ = builder.as_slice_mut();
+        }
+    }
+
+    fn assert_values(builder: &BooleanBufferBuilder, expected: &[bool]) {
+        assert_eq!(builder.len(), expected.len());
+        for (index, value) in expected.iter().enumerate() {
+            assert_eq!(builder.get_bit(index), *value, "bit {index}");
+        }
+    }
+
+    fn append_operation(
+        builder: &mut BooleanBufferBuilder,
+        expected: &mut Vec<bool>,
+        operation: usize,
+        values: &[bool],
+    ) {
+        match operation {
+            0 => {
+                for value in values {
+                    builder.append(*value);
+                }
+            }
+            1 => builder.append_slice(values),
+            2 => {
+                if values.is_empty() {
+                    builder.append_word(u64::MAX, 0);
+                }
+                for chunk in values.chunks(64) {
+                    let word = chunk.iter().enumerate().fold(0, |word, (index, value)| {
+                        word | (u64::from(*value) << index)
+                    });
+                    builder.append_word(word, chunk.len());
+                }
+            }
+            3 => {
+                builder.append_n(values.len(), false);
+                expected.resize(expected.len() + values.len(), false);
+                return;
+            }
+            4 => {
+                builder.append_n(values.len(), true);
+                expected.resize(expected.len() + values.len(), true);
+                return;
+            }
+            5 => {
+                builder.advance(values.len());
+                expected.resize(expected.len() + values.len(), false);
+                return;
+            }
+            6 => {
+                builder.resize(builder.len() + values.len());
+                expected.resize(expected.len() + values.len(), false);
+                return;
+            }
+            7 => {
+                let source_offset = 3;
+                let mut source = BooleanBufferBuilder::new(source_offset + values.len());
+                source.append_n(source_offset, true);
+                source.append_slice(values);
+                builder.append_packed_range(
+                    source_offset..source_offset + values.len(),
+                    source.as_slice(),
+                );
+            }
+            8 => {
+                // SAFETY: a copied slice iterator reports its exact remaining length.
+                unsafe { builder.extend_trusted_len(values.iter().copied()) };
+            }
+            9 => {
+                let mut source = BooleanBufferBuilder::new(3 + values.len());
+                source.append_n(3, true);
+                source.append_slice(values);
+                let source = source.build().slice(3, values.len());
+                builder.append_buffer(&source);
+            }
+            _ => unreachable!(),
+        }
+        expected.extend_from_slice(values);
+    }
+
+    #[test]
+    fn padding_operations_match_vec_oracle() {
+        let initial_lengths: Vec<usize> = if cfg!(miri) {
+            vec![1, 7, 8]
+        } else {
+            (0..=17).collect()
+        };
+        let additions: &[usize] = if cfg!(miri) {
+            &[0, 1, 9, 65]
+        } else {
+            &[0, 1, 2, 7, 8, 9, 15, 16, 63, 64, 65, 129]
+        };
+        let padding_patterns: &[u8] = if cfg!(miri) {
+            &[0xff]
+        } else {
+            &[0, 0xff, 0x55, 0xaa]
+        };
+        let payload_patterns: &[u8] = if cfg!(miri) {
+            &[0, 0xa5]
+        } else {
+            &[0, 0xff, 0xa5]
+        };
+        for initial_len in initial_lengths {
+            for &additional in additions {
+                for &padding in padding_patterns {
+                    for &payload in payload_patterns {
+                        for use_set_bit in [false, true] {
+                            for operation in 0..10 {
+                                let mut expected: Vec<bool> =
+                                    (0..initial_len).map(|i| i % 3 == 0).collect();
+                                let mut builder = BooleanBufferBuilder::new(0);
+                                builder.append_slice(&expected);
+                                dirty_padding(&mut builder, padding, use_set_bit);
+                                let values: Vec<bool> = (0..additional)
+                                    .map(|i| payload & (1 << (i % 8)) != 0)
+                                    .collect();
+                                append_operation(&mut builder, &mut expected, operation, &values);
+                                assert_values(&builder, &expected);
+                                // A partial append may leave dirty padding for a later operation.
+                                append_operation(&mut builder, &mut expected, 1, &[false; 9]);
+                                assert_values(&builder, &expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn padding_advance_zeroes_exposed_bits() {
+        let mut builder = BooleanBufferBuilder::new(8);
+        builder.append(true);
+        builder.set_bit(1, true);
+        builder.advance(1);
+        assert_values(&builder, &[true, false]);
+    }
+
+    #[test]
+    fn padding_reuse_truncate_and_mixed_operations() {
+        let mut expected = vec![true, false, true];
+        let mut builder = BooleanBufferBuilder::new_from_buffer(
+            MutableBuffer::from(vec![0xfd_u8, 0xff]),
+            expected.len(),
+        );
+        assert_values(&builder, &expected);
+        let steps = if cfg!(miri) { 36 } else { 1000 };
+        let mut state = 0xa076_1d64_78bd_642f_u64;
+        for step in 0..steps {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            dirty_padding(&mut builder, (state >> 32) as u8, step % 2 == 0);
+            if step % 7 == 0 && !expected.is_empty() {
+                let index = (state as usize) % expected.len();
+                let value = state & 0x100 != 0;
+                builder.set_bit(index, value);
+                expected[index] = value;
+            }
+            let count = ((state >> 40) as usize) % 18;
+            let values: Vec<bool> = (0..count).map(|i| state & (1 << i) != 0).collect();
+            append_operation(&mut builder, &mut expected, step % 10, &values);
+            assert_values(&builder, &expected);
+            if step % 11 == 0 {
+                let len = expected.len() / 2;
+                builder.truncate(len);
+                expected.truncate(len);
+                builder.reserve(513);
+                assert_values(&builder, &expected);
+            }
+            if step % 13 == 0 {
+                let snapshot = builder.finish_cloned();
+                assert_eq!(snapshot.iter().collect::<Vec<_>>(), expected);
+            }
+            if step % 17 == 0 {
+                dirty_padding(&mut builder, 0xff, false);
+                let finished = builder.finish();
+                assert_eq!(finished.iter().collect::<Vec<_>>(), expected);
+                expected.clear();
+                assert_values(&builder, &expected);
+                append_operation(&mut builder, &mut expected, 0, &[false, true, false]);
+                assert_values(&builder, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn padding_crosses_capacity_boundary() {
+        let mut builder = BooleanBufferBuilder::new(1);
+        builder.append_n(511, true);
+        let mut expected = vec![true; 511];
+        builder.set_bit(511, true);
+        builder.append(false);
+        expected.push(false);
+        for i in 512..1025 {
+            dirty_padding(&mut builder, 0xff, i % 2 == 0);
+            let value = i % 3 == 0;
+            builder.append(value);
+            expected.push(value);
+        }
+        assert_values(&builder, &expected);
+        builder.truncate(511);
+        expected.truncate(511);
+        builder.append_slice(&[false; 65]);
+        expected.extend_from_slice(&[false; 65]);
+        assert_values(&builder, &expected);
     }
 }
